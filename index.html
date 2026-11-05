@@ -278,7 +278,7 @@ const RULES=[
 
 /* ---------- store: Supabase ---------- */
 const CFG=window.CPD_CONFIG||{};
-const SB=(window.supabase&&CFG.SUPABASE_URL&&CFG.SUPABASE_ANON_KEY)?window.supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY):null;
+const SB=(window.supabase&&CFG.SUPABASE_URL&&CFG.SUPABASE_ANON_KEY)?window.supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY,{auth:{flowType:'implicit',detectSessionInUrl:true,persistSession:true,autoRefreshToken:true}}):null;
 const Store=(()=>{
  const COLS=['staff','visits','notifications','settings'];
  const cache={};COLS.forEach(c=>cache[c]={});
@@ -331,13 +331,16 @@ const Store=(()=>{
   const {error}=await SB.rpc('sign_out',{vid:id});if(error){toast('Could not sign out: '+error.message);throw error}
   const v=cache.visits[id];if(v)cache.visits={...cache.visits,[id]:{...v,signedOutAt:new Date().toISOString()}};emit();load();
  }
+ async function verify(email,code){
+  const {error}=await SB.auth.verifyOtp({email,token:code.replace(/\s+/g,''),type:'email'});if(error)throw error;
+ }
  async function login(email){
   const redirect=location.origin+location.pathname+'#admin';
   const {error}=await SB.auth.signInWithOtp({email,options:{emailRedirectTo:redirect,shouldCreateUser:false}});
   if(error)throw error;
  }
  async function logout(){await SB.auth.signOut();session=null;location.hash='';load()}
- return{init,set,del,clear,signOut,login,logout,load,list:c=>Object.values(cache[c]),get:(c,id)=>cache[c][id],sub:f=>subs.push(f),
+ return{init,set,del,clear,signOut,login,verify,logout,load,list:c=>Object.values(cache[c]),get:(c,id)=>cache[c][id],sub:f=>subs.push(f),
   get mode(){return 'db'},get ready(){return ready},get canWrite(){return true},get session(){return session},get err(){return err},get user(){return session&&session.user?session.user.email:''}};
 })();
 
@@ -363,6 +366,7 @@ function composeEmail(v){
 
 /* ---------- app shell / router ---------- */
 const app=$('#app');
+let authErr='';try{const h=new URLSearchParams(location.hash.replace(/^#/,''));const q=new URLSearchParams(location.search);const d=h.get('error_description')||q.get('error_description');if(d){authErr=d.replace(/\+/g,' ');history.replaceState(null,'',location.pathname+'#admin')}else if(h.get('access_token')||q.get('code')){history.replaceState(null,'',location.pathname+'#admin')}}catch{}
 let route=location.hash==='#admin'?'admin':'kiosk';
 window.addEventListener('hashchange',()=>{route=location.hash==='#admin'?'admin':'kiosk';render()});
 Store.sub(()=>{if(route==='admin'||['welcome','signout','done'].includes(K.step))render()});
@@ -577,16 +581,28 @@ function admin(inner){
 function renderAdmin(){
  if(!A.unlocked){
   admin(`<div class="pin"><div>${ICON.pin}<div class="eyebrow" style="margin-top:.5rem">Staff only</div><h2 class="display" style="font-size:1.6rem;margin-top:.4rem">Sign in to the back office</h2></div>
-   ${A.sent?`<div class="callout">Check your inbox for <b>${esc(A.email)}</b> and open the sign-in link. It brings you straight back here, signed in.</div><button class="btn" id="again">Use a different email</button>`
-   :`<p class="muted" style="margin:0">Enter your CPD email address and we will send you a one-time sign-in link. No password needed.</p>
+   ${A.sent?`<p class="muted" style="margin:0">We have emailed a <b>6-digit code</b> to <b>${esc(A.email)}</b>. Type it below. (Check junk if it has not arrived within a minute.)</p>
+   <input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="123456" style="text-align:center;font-size:1.6rem;letter-spacing:.4em;font-variant-numeric:tabular-nums">
+   <div class="err">${esc(A.loginErr||'')}</div><button class="btn primary big" id="verify">Sign in</button>
+   <button class="btn ghost" id="again">Send a new code / use a different email</button>`
+   :`<p class="muted" style="margin:0">Enter your CPD email address and we will email you a one-time sign-in code. No password needed.</p>
    <input id="email" type="email" placeholder="you@cpdbodies.com" value="${esc(A.email)}" autocomplete="email" style="text-align:left;font-size:1rem;letter-spacing:0">
-   <div class="err">${esc(A.loginErr||'')}</div><button class="btn primary big" id="send">Email me a sign-in link</button>`}
+   <div class="err">${esc(A.loginErr||authErr||'')}</div><button class="btn primary big" id="send">Email me a sign-in code</button>`}
    ${Store.err?`<div class="err">${esc(Store.err)}</div>`:''}</div>`);
-  if(A.sent){$('#again').onclick=()=>{A.sent=false;render()};return}
+  if(A.sent){
+   const c=$('#code');c.focus();
+   const ver=async()=>{const code=c.value.trim();if(code.length<6){A.loginErr='Enter the 6-digit code from the email.';render();return}
+    const b=$('#verify');b.disabled=true;b.textContent='Checking…';
+    try{await Store.verify(A.email,code);A.sent=false;A.loginErr='';authErr='';location.hash='#admin'}
+    catch(x){A.loginErr=/expired|invalid/i.test(x.message)?'That code is wrong or has expired. Request a new one.':x.message;render()}};
+   $('#verify').onclick=ver;c.onkeydown=e=>{if(e.key==='Enter')ver()};
+   $('#again').onclick=()=>{A.sent=false;A.loginErr='';render()};
+   return;
+  }
   const em=$('#email');em.focus();
   const go2=async()=>{const e=em.value.trim().toLowerCase();if(!e.includes('@')){A.loginErr='Enter a valid email address.';render();return}
    const b=$('#send');b.disabled=true;b.textContent='Sending…';
-   try{await Store.login(e);A.email=e;A.sent=true;A.loginErr=''}catch(x){A.loginErr=/signups not allowed|not allowed|not found/i.test(x.message)?'That email is not registered for back-office access. Ask an administrator to invite you in Supabase.':x.message}
+   try{await Store.login(e);A.email=e;A.sent=true;A.loginErr='';authErr=''}catch(x){A.loginErr=/signups not allowed|not allowed|not found/i.test(x.message)?'That email is not registered for back-office access. Ask an administrator to invite you in Supabase.':/rate limit/i.test(x.message)?'Too many sign-in emails have been sent recently. Please wait an hour and try again.':x.message}
    render()};
   $('#send').onclick=go2;em.onkeydown=e=>{if(e.key==='Enter')go2()};
   return;
